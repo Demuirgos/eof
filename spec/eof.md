@@ -109,43 +109,6 @@ The following validity constraints are placed on the container format:
 - the total size of a deployed container with at least one container section must be `16 + 2*num_code_sections + types_size + code_size[0] + ... + code_size[num_code_sections-1] + data_size + 2*num_container_sections + container_size[0] + ... + container_size[num_container_sections-1]`
 - the total size of not yet deployed container might be up to `data_size` lower than the above values due to how the data section is rewritten and resized during deployment (see [Data Section Lifecycle](#data-section-lifecycle))
 
-## Transaction Types
-
-Introduce new transaction type `InitcodeTransaction` which extends EIP-1559 (type 2) transaction by adding a new field `initcodes: List[ByteList[MAX_INITCODE_SIZE], MAX_INITCODE_COUNT]`.
-
-The `initcodes` can only be accessed via the `TXCREATE` instruction (see below), therefore `InitcodeTransactions` are intended to be sent to contracts including `TXCREATE` in their execution.
-
-We introduce a standardised Creator Contract (i.e. written in EVM, but existing at a known address, such as precompiles), which eliminates the need to have create transactions with empty `to`. Deployment of the Creator Contract will require an irregular state change at EOF activation block. Note that such introduction of the Creator Contract is needed, because only EOF contracts can create EOF contracts. See the appendix below for Creator Contract code.
-
-Under transaction validation rules `initcodes` are not validated for conforming to the EOF specification. They are only validated when accessed via `TXCREATE`. This avoids potential DoS attacks of the mempool. If during the execution of an `InitcodeTransaction` no `TXCREATE` instruction is called, such transaction is still valid.
-
-`initcodes` data is similar to calldata for two reasons:
-1) It must be fully transmitted in the transaction.
-2) It is accessible to the EVM, but it can't be fully loaded into EVM memory.
-
-For these reasons, define cost of each of the `initcodes` items same as calldata (16 gas for non-zero bytes, 4 for zero bytes -- see EIP-2028). The intrinsic gas of an `InitcodeTransaction` is extended by the sum of all those items' costs.
-
-EIP-3860 and EIP-170 still apply, i.e. `MAX_CODE_SIZE` as 24576, `MAX_INITCODE_SIZE` as `2 * MAX_CODE_SIZE`. Define `MAX_INITCODE_COUNT` as 256.
-`InitcodeTransaction` is invalid if there are more than `MAX_INITCODE_COUNT` entries in `initcodes`, or if any exceeds `MAX_INITCODE_SIZE`.
-
-`InitcodeTransaction` is invalid if the `to` is `nil`.
-
-#### RLP and signature
-
-Given the definitions from [EIP-2718](https://eips.ethereum.org/EIPS/eip-2718) the `TransactionPayload` for an `InitcodeTransaction` is the RLP serialization of:
-
-```
-[chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, to, value, data, access_list, initcodes, y_parity, r, s]
-```
-
-`TransactionType` is `INITCODE_TX_TYPE` (`0x04`) and the signature values `y_parity`, `r`, and `s` are calculated by constructing a secp256k1 signature over the following digest:
-
-```
-keccak256(INITCODE_TX_TYPE || rlp([chain_id, nonce, max_priority_fee_per_gas, max_fee_per_gas, gas_limit, to, value, data, access_list, initcodes]))
-```
-
-The [EIP-2718](https://eips.ethereum.org/EIPS/eip-2718) `ReceiptPayload` for this transaction is `rlp([status, cumulative_transaction_gas_used, logs_bloom, logs])`.
-
 ## Execution Semantics
 
 Code executing within an EOF environment will behave differently than legacy code. We can break these differences down into i) changes to existing behavior and ii) introduction of new behavior.
@@ -161,10 +124,25 @@ Code executing within an EOF environment will behave differently than legacy cod
 - The instruction `JUMPDEST` is renamed to `NOP` and remains charging 1 gas without any effect.
     - Note: jumpdest-analysis is not performed anymore.
 - EOF contract may not deploy legacy code (it is naturally rejected on the code validation stage)
-- Legacy creation transactions (any tranactions with empty `to`) are invalid in case `data` contains EOF code (starts with `EF00` magic)
-- If instructions `CREATE` and `CREATE2` have EOF code as initcode (starting with `EF00` magic)
-    - deployment fails (returns 0 on the stack)
-    - caller's nonce is not updated and gas for initcode execution is not consumed
+
+#### Creation transactions
+
+Creation transactions (tranactions with empty `to`), with `data` containing EOF code (starting with `EF00` magic) are interpreted as having an EOF `initcontainer` in the `data` and:
+
+- intrinsic gas cost rules and limits defined in EIP-3860 for legacy creation transaction apply. The entire `initcontainer` is treated as initcode
+- **the initcontainer and all its subcontainers are validated recursively**
+- it is checked if the initcode container has its `len(data_section)` equal to `data_size`, i.e. data section content is exactly as the size declared in the header (see [Data section lifecycle](#data-section-lifecycle))
+- transaction fails if any of those checks were invalid (gas for initcode execution is not consumed. Only intrinsic creation transaction costs were consumed)
+- execute the container in "initcode-mode" and deduct gas for execution
+    - calculate `new_address` as `keccak256(sender || sender_nonce)[12:]`
+    - a successful execution ends with initcode executing `RETURNCONTRACT{deploy_container_index}(aux_data_offset, aux_data_size)` instruction (see below). After that:
+        - load deploy EOF subcontainer at `deploy_container_index` in the container from which `RETURNCONTRACT` is executed
+        - concatenate data section with `(aux_data_offset, aux_data_offset + aux_data_size)` memory segment and update data size in the header
+        - if updated deploy container size exceeds `MAX_CODE_SIZE` instruction exceptionally aborts
+        - set `state[new_address].code` to the updated deploy container
+        - push `new_address` onto the stack
+    - `RETURN` and `STOP` are not allowed in "initcode-mode" (abort execution)
+- deduct `200 * deployed_code_size` gas
 
 **NOTE** Legacy contract and legacy creation transactions may not deploy EOF code, that is behavior from [EIP-3541](https://eips.ethereum.org/EIPS/eip-3541) is not modified.
 
@@ -227,24 +205,12 @@ The following instructions are introduced in EOF code:
             - push `new_address` onto the stack
         - `RETURN` and `STOP` are not allowed in "initcode-mode" (abort execution)
     - deduct `200 * deployed_code_size` gas
-- `TXCREATE (0xed)` instruction
-    - Works the same as `EOFCREATE` except:
-        - does not have `initcontainer_index` immediate
-        - pops one more value from the stack (first argument): `tx_initcode_hash`
-        - loads the initcode EOF container from the transaction `initcodes` array which hashes to `tx_initcode_hash`
-            - fails (returns 0 on the stack) if such initcode does not exist in the transaction, or if called from a transaction of `TransactionType` other than `INITCODE_TX_TYPE`
-                - caller's nonce is not updated and gas for initcode execution is not consumed. Only `TXCREATE` constant gas was consumed
-        - in addition to hashing charge as in `EOFCREATE`, deducts `2 * ((initcontainer_size + 31) // 32)` gas (EIP-3860 charge)
-        - just before executing the initcode container:
-            - **validates the initcode container and all its subcontainers recursively**
-            - in addition to this, checks if the initcode container has its `len(data_section)` equal to `data_size`, i.e. data section content is exactly as the size declared in the header (see [Data section lifecycle](#data-section-lifecycle))
-            - fails (returns 0 on the stack) if any of those was invalid
-                - caller’s nonce is not updated and gas for initcode execution is not consumed. Only `TXCREATE` constant, EIP-3860 gas and hashing gas were consumed
 - `RETURNCONTRACT (0xee)` instruction
     - loads `uint8` immediate `deploy_container_index`
     - pops two values from the stack: `aux_data_offset`, `aux_data_size` referring to memory section that will be appended to deployed container's data
     - cost 0 gas + possible memory expansion for aux data
-    - ends initcode frame execution and returns control to `EOFCREATE` or `TXCREATE` caller frame where `deploy_container_index` and `aux_data` are used to construct deployed contract (see above)
+    - ends initcode frame execution and returns control to `EOFCREATE` caller frame (unless called in the topmost frame of a creation transaction).
+    - `deploy_container_index` and `aux_data` are used to construct deployed contract (see above)
     - instruction exceptionally aborts if after the appending, data section size would overflow the maximum data section size or underflow (i.e. be less than data section size declared in the header)
     - instruction exceptionally aborts if invoked not in "initcode-mode"
 - `DATALOAD (0xd0)` instruction
@@ -342,37 +308,6 @@ The following instructions are introduced in EOF code:
 - maximum data stack of a function must not exceed 1023
 - `types[current_code_index].max_stack_height` must match the maximum stack height observed during validation
 - Find full spec of the previous _more restrictive_ algorithm at https://eips.ethereum.org/EIPS/eip-5450#operand-stack-validation
-
-## Appendix: Creator Contract
-
-```solidity
-{
-/// Takes [index][salt][init_data] as input,
-/// creates contract and returns the address or failure otherwise
-
-/// init_data.length can be 0, but the first 2 words are mandatory
-let size := calldatasize()
-if lt(size, 64) { revert(0, 0) }
-
-let tx_initcode_index := calldataload(0)
-let salt := calldataload(32)
-
-let init_data_size := sub(size, 64)
-calldatacopy(0, 64, init_data_size)
-
-let ret := txcreate(tx_initcode_index, callvalue(), salt, 0, init_data_size)
-if iszero(ret) { revert(0, 0) }
-
-mstore(0, ret)
-return(0, 32)
-
-// Helper to compile this with existing Solidity (with --strict-assembly mode)
-function txcreate(a, b, c, d, e) -> f {
-    f := verbatim_5i_1o(hex"ed", a, b, c, d, e)
-}
-    
-}
-```
 
 ## Appendix: Original EIPs
 
